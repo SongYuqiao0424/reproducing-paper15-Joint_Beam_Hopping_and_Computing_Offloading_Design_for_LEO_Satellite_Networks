@@ -107,7 +107,7 @@ class SimConfig:
     max_swap_iterations: int = 100     # N_max：Algorithm 4 的 swap 次数；论文图 2b 取 100。
     max_repair_iterations: int = 60    # Algorithm 3 步骤 7-17 的可行性修复上限（见 solvers 说明）。
     tolerance: float = 1e-6            # ε_A / ε̃：收敛判据。
-    solver_backend: str = "cvxpy"      # "cvxpy"=用 CVXPY 严格建模凸子问题；"fast"=用等价的精确二分解析解。
+    solver_backend: str = "fast"      # "cvxpy"=用 CVXPY 严格建模凸子问题；"fast"=用等价的精确二分解析解。
     random_seed: int = 7               # 随机种子，保证任务生成 / swap 随机过程可复现。
 
     # ---------- 由 __post_init__ 生成的派生数据 ----------

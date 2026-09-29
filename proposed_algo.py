@@ -73,7 +73,7 @@ def proposed_jbhco_mb(
     # ---- 第 9-10 行：对初始匹配求 A、f^S，并算出 G(Ω) ----
     result = solve_joint_offloading_and_allocation(config, network, channel_model, beam_hopping_plan)
     best_objective = float(result["max_lambda"])            # G(Ω) = max_i λ_i
-    history: List[float] = [best_objective] if record_history else []
+    history: List[float] = [best_objective] if record_history else []   # record_history为是否记录历史的标志，默认开启
     accepted_swaps = 0                                      # 实际被接受的 swap 次数
     attempted_swaps = 0                                     # 实际构造出可行交换的次数
 
@@ -87,7 +87,7 @@ def proposed_jbhco_mb(
         if candidate_plan is None:
             # 这次抽样不构成可行交换（会违反 C1 或去冗余规则），不消耗 swap 预算的判定
             if record_history:
-                history.append(best_objective)
+                history.append(best_objective)  # ！！不增加 attempted_swaps 计数，但增加历史记录是否合适，难道因为history与swap_budget有关？
             continue
         attempted_swaps += 1
 

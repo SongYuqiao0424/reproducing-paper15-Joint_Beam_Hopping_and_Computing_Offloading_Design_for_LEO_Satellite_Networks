@@ -105,7 +105,7 @@ def build_psi_matrix(
     """
     num_satellites = len(network.satellites)
     num_users = len(network.user_tasks)
-    # 取值为inf是因为若卫星 s 在这个 BHTP 下从未照明小区 i，则C^BH_{s,i}为0，但是计算应当使用C^BH_i，其值一定不为0，需修改
+    # 取值为inf是因为若卫星 s 在这个 BHTP 下从未照明小区 i，则C^BH_{s,i}为0，但是计算应当使用C^BH_i，其值一定不为0，可能需修改
     psi_unit = [[float("inf")] * num_users for _ in range(num_satellites)]
     for user_index, task in enumerate(network.user_tasks):
         local_time = local_latency_s(task)
@@ -231,13 +231,16 @@ def evaluate_objective(config, network, channel_model, access_matrix, allocation
 # =====================================================================
 def _minimax_allocation_on_satellite(
     users: Sequence[int],
-    psi_value: Sequence[float],
-    workload_coef: Sequence[float],
-    budget_cps: float,
+    psi_value: Sequence[float],     # ψ_i
+    workload_coef: Sequence[float], # (O_i/D_i)
+    budget_cps: float,              # f_max
 ) -> Tuple[float, Dict[int, float]]:
     """单颗卫星上的 minimax 计算资源分配，二分求解。
 
-    子问题：min ε  s.t. ψ_i + (O_i/D_i)/f_i ≤ ε ∀i∈U_s,  Σ_{i∈U_s} f_i ≤ f_max,  f_i ≥ 0
+    (对于卸载用户，仅卸载卫星s的a_i,s为1，故P3中相关求和表述可省略)
+    (f_i是f_i,s的略写，因为此时就是在计算卫星s的计算资源分配策略，i是所有选择卸载至卫星s的用户)
+    (ε返回值为卫星 s 上所有用户的共同最坏时延满意度上界，故仅返回一个值，而f_i则需要返回字典)
+    子问题P3：min ε  s.t. ψ_i + (O_i/D_i)/f_i ≤ ε ∀i∈U_s,  Σ_{i∈U_s} f_i ≤ f_max,  f_i ≥ 0
 
     对给定的 ε，约束等价于 f_i ≥ (O_i/D_i)/(ε − ψ_i)，于是
         "ε 可行" ⟺ Σ_i (O_i/D_i)/(ε − ψ_i) ≤ f_max
@@ -246,7 +249,7 @@ def _minimax_allocation_on_satellite(
 
     返回 (ε_s, {用户下标: f^S_{s,i}(cycle/s)})；users 为空时返回 (0.0, {})。
     """
-    if not users:
+    if not users:   # 无用户不必分配资源
         return 0.0, {}
     lower = max(psi_value[i] for i in users)          # ε 必须严格大于所有 ψ_i
 
@@ -274,8 +277,9 @@ class OffloadingState:
 
     把当前卸载和资源分配方案封装起来；当尝试移动一个用户时，只重新计算受影响卫星的资源分配，从而快速判断新的 max_i λ_i 是否更小。
 
-    它把论文的 λ_i 表达式拆成两类（式 (27)(28)）：
+    它把论文的 λ_i 表达式拆成两类（式 (27)(28)）:
         本地计算用户： λ_i = L_i = O_i/(D_i f^l_i)          —— 与 f^S 无关
+        （对于卸载用户,仅卸载卫星s的a_i,s为1,故式27、28中求和可省略）
         卸载用户：     λ_i = ψ_i + (O_i/D_i)/f^S_{s,i}      —— 由所在卫星的 minimax 分配决定
     因为约束 C2 是按卫星分别写的、各卫星互不耦合，所以
         max_i λ_i = max( 本地用户的 L_i , 各卫星的 ε_s )
@@ -288,8 +292,8 @@ class OffloadingState:
         self,
         config: SimConfig,
         network: SatelliteNetwork,
-        psi_unit: List[List[float]],
-        assignment: Optional[Sequence[Optional[int]]] = None,
+        psi_unit: List[List[float]],    # 用于存储式28除a_i,s外常数部分计算结果，可见第一节 build_psi_matrix 函数
+        assignment: Optional[Sequence[Optional[int]]] = None,   #各用户的接入卫星编号，本地卸载为None
     ):
         self.config = config
         self.network = network
@@ -316,23 +320,27 @@ class OffloadingState:
         return self.local_lambda[user_index] + self.psi_unit[sat_id][user_index]
 
     def _refresh_all(self) -> None:
-        """根据当前 assignment 重算各卫星的服务用户集合、ε_s 和 f^S。"""
-        self.served: List[List[int]] = [[] for _ in range(self.num_satellites)]
-        self.psi_value = [0.0] * self.num_users
+        """根据当前 assignment 重算各卫星的服务用户集合、ε_s 和 f^S。
+           即根据用户选择卫星情况A，重新计算卫星计算资源分配f，属于算法2的内容
+        """
+        self.served: List[List[int]] = [[] for _ in range(self.num_satellites)] # 各卫星服务的小区列表
+        self.psi_value = [0.0] * self.num_users # 保存原文式28中的ψ_i（原文是ψ_i,s，但应该不正确，对s求和后角标应该只有i）
         for user_index, sat_id in enumerate(self.assignment):
             self.psi_value[user_index] = self._psi_of(user_index, sat_id)
             if sat_id is not None:
                 self.served[sat_id].append(user_index)
         self.epsilon = [0.0] * self.num_satellites
         self.allocation_per_sat: List[Dict[int, float]] = [{} for _ in range(self.num_satellites)]
-        for sat_id in range(self.num_satellites):
+        for sat_id in range(self.num_satellites):   # ！！！求解各卫星的ε和卫星计算资源分配；一个卫星的ε结果代表关联此卫星的各用户maxλ，所有卫星的ε结果最终可以代表全部用户的maxλ
             self.epsilon[sat_id], self.allocation_per_sat[sat_id] = _minimax_allocation_on_satellite(
                 self.served[sat_id], self.psi_value, self.workload, self.budget
             )
 
     # ---------- 对外：目标值与增量评估 ----------
     def objective(self) -> float:
-        """当前方案的 max_i λ_i。"""
+        """当前方案的 max_i λ_i，分别获取本地用户与卸载用户 max_i λ_i 再取其中较大值
+           需要注意对于卸载用户此前已经根据其卸载卫星计算过各卫星的 λ_i，故取所有卫星中max λ_i也就是所有卸载用户中max λ_i
+        """
         local_max = max(
             (self.local_lambda[i] for i, s in enumerate(self.assignment) if s is None), default=0.0
         )
@@ -428,20 +436,29 @@ class OffloadingState:
         的根本原因）。
 
         正确做法是让 ζ 回答"如果我加入这颗星，我能分到多少"：把用户 i 临时放进
-        U_s 重做一次 minimax 分配，取它分到的那一份。这样 Algorithm 1 就成为严格
+        U_s 重做一次 minimax 分配，取它分到的那一份（只需要将 ）。这样 Algorithm 1 就成为严格
         的最优响应步骤，BCD 才能在各卫星之间真正做负载均衡。
+
+        目前是对 策略确定卸载至卫星s的用户+单个假设卸载至卫星s的用户 重新计算资源分配
+        这样会导致这些假设用户过于乐观，结果有多个用户选择接入，但实际分配时却远远不够，导致新策略被拒
         """
         forecast = [[0.0] * self.num_users for _ in range(self.num_satellites)]
         for sat_id in range(self.num_satellites):
             base_users = self.served[sat_id]
             for user_index in range(self.num_users):
                 if not math.isfinite(self.psi_unit[sat_id][user_index]):
-                    continue                                   # 该星没照明这个小区
+                    # psi_unit为式28右边求和项除了a_i,s的部分，若其值为inf表示C^BH_i,s为0，即该星整个BHTP没照明这个小区，
+                    # 用户i也不可能卸载此卫星，无需模拟分配计算资源
+                    continue                                   
                 if user_index in base_users:
+                    # 若此用户在A中确定卸载至卫星，则此前计算过资源分配。直接使用无需预测
                     forecast[sat_id][user_index] = self.allocation_per_sat[sat_id].get(user_index, 0.0)
                     continue
+                # 现在计算的用户，在BHTP中曾被卫星s照射，但并未选择卸载至此卫星
+                # 原本计算此用户ψ时，psi_of输入为(i,None),此时输入卫星s即假设其卸载至卫星s，重新获取ψ
                 trial_psi = list(self.psi_value)
                 trial_psi[user_index] = self._psi_of(user_index, sat_id)
+                # 输入“策略确定卸载至卫星s的用户+此假设卸载至卫星s的用户”，简化运算，计算此用户的预测f
                 _, per_user = _minimax_allocation_on_satellite(
                     base_users + [user_index], trial_psi, self.workload, self.budget
                 )
@@ -492,11 +509,11 @@ def _solve_offloading_fast(
     num_satellites = len(network.satellites)
     num_users = len(network.user_tasks)
     association: RelaxedAccessMatrix = [[0.0] * num_users for _ in range(num_satellites)]
-    gamma = 0.0
+    gamma = 0.0 # γ
     for user_index, task in enumerate(network.user_tasks):
         local_term = local_latency_s(task) / task.max_latency_s          # L_i
-        best_sat, best_zeta = None, 0.0
-        for sat_id in range(num_satellites):
+        best_sat, best_zeta = None, 0.0 # ζ
+        for sat_id in range(num_satellites):    # 对每个用户遍历所有卫星，选择最小ζ的卫星
             value = zeta_matrix[sat_id][user_index]
             if math.isfinite(value) and value < best_zeta:
                 best_sat, best_zeta = sat_id, value
@@ -709,7 +726,7 @@ def solve_joint_offloading_and_allocation(
 
     与论文 Algorithm 3 伪代码的对应关系：
         第 1-2 行   给定 BHTP，取 A 与 f^S 的可行初值
-        第 3-6 行   BCD 交替：Algorithm 2 更新 f^S → Algorithm 1 更新 A，直到收敛
+        第 3-6 行   BCD 交替：Algorithm 2 更新 f^S → Algorithm 1/逐用户最优响应 更新 A，直到收敛
         第 7-17 行  按卸载比例降序把松弛解恢复成 0-1 解，并逐个检查 C1~C6
 
     返回字典含 access_matrix / allocation / max_lambda / bcd_history 等。
@@ -722,7 +739,7 @@ def solve_joint_offloading_and_allocation(
     # 取"全本地计算"（A = 0）作为初值：它必然满足 C1~C6，同时也是一个明确的性能
     # 基准 —— 后续每一步 BCD 只有比它更好才会被接受。
     state = OffloadingState(config, network, psi_unit, [None] * num_users)
-    best_objective = state.objective()
+    best_objective = state.objective()  # max λ_i，即优化目标，需要最小化此变量
 
     # ---- 第 3-6 行：BCD 交替 ----
     # bcd_history[0] 记录第 2 行给出的初值（全本地）的目标，之后每一项是一轮 BCD 迭代
@@ -736,13 +753,16 @@ def solve_joint_offloading_and_allocation(
         # 第 5 行：给定 f^S，用 Algorithm 1 更新 A
         zeta_matrix = build_zeta_matrix(config, network, capacity_table, forecast)
         offloading_result = solve_offloading(config, network, zeta_matrix)
+        # 若 solve_offloading 函数使用cvxpy求解，则需 _assignment_from_matrix 对其离散化
         proposed = _assignment_from_matrix(offloading_result["association_relaxed"], num_users)
+        # 按用户顺序依次排列其选择的卫星，若本地卸载或选择的卫星并未在BHTP中照射该小区，则为None
         proposed = [
             sat if sat is not None and math.isfinite(psi_unit[sat][i]) else None
             for i, sat in enumerate(proposed)
         ]
 
         # P̃2 是"所有用户同时做最优响应"，当大家都涌向同一颗卫星时会出现拥塞过冲。
+        # 产生此现象原因为， forecast_matrix 函数计算预测资源分配时，是单独对每个卫星假设上星，分配量较多过于乐观，可能导致最终多卫星选择进而实际分配量较少
         # 因此加一道单调性保护：整体更新只有确实降低了真实目标才接受；否则退化为
         # 逐用户最优响应（仍属块坐标下降，只是把每个 a_i 视作一个块），保证 BCD 的
         # 目标序列单调不增，与论文图 2a 的收敛形态一致。
@@ -750,18 +770,26 @@ def solve_joint_offloading_and_allocation(
         candidate_objective = candidate_state.objective()
         if candidate_objective < best_objective - config.tolerance:
             state, best_objective = candidate_state, candidate_objective
-        else:
-            improved = _sequential_best_response(config, state, plan, network)
-            if improved >= best_objective - config.tolerance:
+        else:   
+            # 若新优化目标值收敛或恶化，则进行逐个尝试本地计算和其他卫星；如果没有任何动作能继续降低目标，立刻break
+            # 逐用户最优响应 与 上方算法1整体更新用户关联卫星A 完全无关，是独立的优化步骤，即上述方法结果不接受时采用此方法
+            # ！！！原文中 逐用户最优响应 并不在BCD中使用，仅在BCD结束后使用一次，此处加入为了修正 forecast_matrix 函数的乐观预测问题，也可以删除
+            # _sequential_best_response 函数中会修改state，无需额外赋值
+            improved = _sequential_best_response(config, state, plan, network)  
+            # _sequential_best_response 函数中也会判断策略变动是否会超过阈值，若超过阈值则会更新state，并令improved等于新优化目标值
+            # 若其内部第一次尝试改变策略就不超过阈值，表示原策略为局部最优，则state不会变动，且improved = best_objective。
+            if improved >= best_objective - config.tolerance:   
+                # 此时代表本轮BCD中Algorithm 1与逐用户最优响应均收敛，结束BCD，策略A与优化目标值λ取值为上一轮BCD结果
                 bcd_history.append(best_objective)
-                break                                   # 第 6 行：收敛
-            best_objective = improved
+                break                                   
+            best_objective = improved                   # 若未收敛则记录最新优化目标值λ，继续BCD
         bcd_history.append(best_objective)
 
     # ---- 第 7-17 行：0-1 恢复 + 逐用户可行性检查 ----
     # 状态对象里的 assignment 本身已是 0-1 解（P̃2 的最优解天然整数），这里再做一次
     # 逐用户扫描，确认不存在"换一颗星或改本地就能更好"的违反情形，对应论文
     # 第 10-16 行"取最大的 a^{s̃}_i；若不满足约束就把 s̃ 从 S' 中去掉再试下一个"。
+    # ！！！由于BCD中添加了 逐用户最优响应 故此处可能可以删除，若不删除且此处确实再次进行优化，则实际优化目标值与 bcd_history 最后的值不同
     _sequential_best_response(config, state, plan, network)
 
     access_matrix = state.access_matrix()
@@ -796,20 +824,27 @@ def _sequential_best_response(
     current = state.objective()
     for _ in range(config.max_repair_iterations):
         lambdas = state.user_lambdas()
+        # 根据 lambdas[i] 比较大小，返回最大值对应index
         worst_user = max(range(len(lambdas)), key=lambda i: lambdas[i])
         cell_id = network.user_tasks[worst_user].cell_id
 
+        # 可选择关联的卫星列表，即BHTP中至少照射小区一次的卫星；None表示本地计算
         actions: List[Optional[int]] = [None] + illuminating_satellites(plan, cell_id)
         best_action, best_value = None, current
         found = False
         for action in actions:
+            # 新选择的卫星与原A中的关联卫星相同，跳过
             if action == state.assignment[worst_user]:
                 continue
+            # 若不同则计算更改卫星后，λ的变化，变化大于阈值则更新
             value = state.evaluate_move(worst_user, action)
-            if value < best_value - 1e-12:
+            if value < best_value - config.tolerance:
                 best_action, best_value, found = action, value, True
         if not found:
-            break                                   # 已是局部最优
+            break                                   # 未找到新动作，已是局部最优
+        # 采用新动作/用户关联卫星矩阵A，并重算卫星资源分配f以及优化目标λ
+        # ！！！从循环逻辑看，只要第一个卫星的动作/改变策略成功，state会根据 逐用户最优响应 逻辑改变策略
+        # ！！！反之，仅当第一个卫星的动作/改变策略失败，state才会保持不变
         state.apply_move(worst_user, best_action)
         current = state.objective()
     return current
@@ -858,7 +893,7 @@ def design_beam_hopping_matching(
         "Calculate U 并更新偏好列表"所描述的动态偏好。
         """
         active = [(s, c) for s in range(num_satellites) for c in holders[slot_id][s]]
-        # active.append((sat_id, cell_id)) 貌似与890行重复了
+        # active.append((sat_id, cell_id)) 貌似与下方“holders[slot_id][sat_id].append(cell_id)”重复了
         sinr = channel_model.compute_sinr_for_user(sat_id, cell_id, active)
         return channel_model._capacity_from_sinr(sinr)
 
@@ -1087,11 +1122,11 @@ def propose_swap(
     返回 None 表示这次随机抽样不构成可行交换（下面三种情况），调用方跳过即可：
       - i == i'：交换没有意义；
       - i' 已在 J_t 被同一颗卫星点亮（或 i 已在 J_t'）：交换后该星波束数会掉，违反 C1；
-      - 交换后某个小区在整个 BHP 内一次都没被照明，失去卸载机会。
+      - 交换后某个小区在整个 BHP 内一次都没被照明，失去卸载机会。（貌似不存在此情况）
 
     注意：论文定义 3 只要求 Ω^{t,t'}_{i,i'} 满足 C1~C6。"同一时隙不重复照明同一小区"
     属于初始匹配阶段的偏好置零规则，不是硬约束，所以这里不再限制 —— 否则可行交换
-    比例会低到 swap 几乎无法进行（实测 100 次抽样仅 2 次可行）。
+    比例会低到 swap 几乎无法进行。
     """
     num_slots = len(plan)
     num_satellites = len(plan[0])
@@ -1100,14 +1135,15 @@ def propose_swap(
 
     sat_id = rng.randrange(num_satellites)
     slot_a, slot_b = rng.sample(range(num_slots), 2)
+    # 卫星在这两个时隙照射小区的列表
     cells_a = [c for c, v in enumerate(plan[slot_a][sat_id]) if v]
     cells_b = [c for c, v in enumerate(plan[slot_b][sat_id]) if v]
-    if not cells_a or not cells_b:
+    if not cells_a or not cells_b:  # 某时隙无照射小区，无法交换
         return None
     cell_a, cell_b = rng.choice(cells_a), rng.choice(cells_b)
-    if cell_a == cell_b:
+    if cell_a == cell_b:    # 交换的小区相同，无法交换
         return None
-    if plan[slot_a][sat_id][cell_b] or plan[slot_b][sat_id][cell_a]:
+    if plan[slot_a][sat_id][cell_b] or plan[slot_b][sat_id][cell_a]:    # 小区在交换后的时隙已被照射
         return None                                        # 会导致波束数下降，违反 C1
 
     candidate = copy.deepcopy(plan)
@@ -1116,10 +1152,12 @@ def propose_swap(
     candidate[slot_b][sat_id][cell_b] = 0
     candidate[slot_b][sat_id][cell_a] = 1
 
-    for cell_id in (cell_a, cell_b):                       # 每个小区仍须至少被照明一次
-        if not any(candidate[t][s][cell_id]
-                   for t in range(num_slots) for s in range(num_satellites)):
-            return None
+    # 初始plan满足覆盖前提下，不存在此种情况
+    # for cell_id in (cell_a, cell_b):                       # 每个小区仍须至少被照明一次
+    #     if not any(candidate[t][s][cell_id]
+    #                for t in range(num_slots) for s in range(num_satellites)):
+    #         return None
+        
     return candidate
 
 
