@@ -15,9 +15,9 @@
 config.solver_backend 可取：
   "cvxpy"：严格按论文用凸优化建模 P̃2 / P̃3，交给 CVXPY 调 CLARABEL/SCS 求解，
            对应论文 Algorithm 1/2 里的 "Solve P̃2(P̃3) with CVX"。
-  "fast" ：用与该凸问题严格等价的闭式解 / 二分解法（推导写在对应函数注释里）。
-两者结果一致（verify_solvers.py 会逐点核对），但 "fast" 快 2~3 个数量级，
-扫描仿真图时必须用它。
+  "fast" ：P̃2 用闭式解，P̃3 仅支持整数关联下的逐星二分；分数关联应使用 cvxpy。
+公开子问题求解器成功返回时必须满足 C4；当前联合搜索仍保留预测矩阵和
+最差用户局部搜索，不应将其理解为已恢复论文原始的松弛 BCD 流程。
 """
 
 from __future__ import annotations
@@ -42,6 +42,21 @@ CapacityTable = Dict[Tuple[int, int], float]  # C^BH_{s,i}：链路容量？，�
 
 _LIGHT_SPEED_M_S = 299792458.0                # c：光速，单位 m/s
 _BISECTION_STEPS = 48                         # 二分次数；48 次可把区间压到 1e-14 量级
+_FEASIBILITY_TOL = 1e-7                     # 无量纲约束残差容差，不是放宽用户时限。
+
+
+class InfeasibleSubproblemError(RuntimeError):
+    """当前固定变量子问题不可行；不表示原联合问题全局不可行。"""
+
+
+class FeasibleSolutionNotFoundError(RuntimeError):
+    """当前启发式搜索未找到可行解；不能用作全局不可行证明。"""
+
+
+def _require_c4(value: float, context: str) -> None:
+    """所有公开子问题求解器的成功出口必须满足 C4。"""
+    if not math.isfinite(value) or value > 1.0 + _FEASIBILITY_TOL:
+        raise InfeasibleSubproblemError(f"{context} 不满足 C4：max λ = {value}；当前子问题不可行")
 
 
 # =====================================================================
@@ -190,6 +205,7 @@ def evaluate_latency(
     normalized: List[float] = []
     local_users: List[int] = []
     offloaded_users: List[int] = []
+    invalid_offloaded_users: List[int] = []
 
     for user_index, task in enumerate(network.user_tasks):
         sat_id = selected_satellite(access_matrix, user_index)
@@ -197,14 +213,16 @@ def evaluate_latency(
             latency = local_latency_s(task)                        # 式 (18) 中 Σa=0 的分支
             local_users.append(task.user_id)
         else:
+            offloaded_users.append(task.user_id)
             overhead = communication_overhead_s(config, network, task, sat_id, capacity_table)
             available = allocation[sat_id][user_index]
-            if math.isfinite(overhead) and available > 0.0:
+            if math.isfinite(overhead) and math.isfinite(available) and available > 0.0:
                 latency = overhead + task.required_cycles / available   # 式 (11)
-                offloaded_users.append(task.user_id)
             else:
-                latency = local_latency_s(task)                    # 该星实际无法服务 → 退回本地
-                local_users.append(task.user_id)
+                # A 已指定卸载，不能只在评估时偷偷改成本地。零容量/零算力
+                # 使该卸载无法完成，返回 inf，让 C4 和最终可行性检查拒绝它。
+                latency = float("inf")
+                invalid_offloaded_users.append(task.user_id)
         latencies.append(latency)
         normalized.append(latency / max(task.max_latency_s, 1e-12))
 
@@ -215,8 +233,39 @@ def evaluate_latency(
         "max_lambda": max(normalized, default=0.0),
         "local_users": local_users,
         "offloaded_users": offloaded_users,
-        "constraint_C4_ok": all(value <= 1.0 + 1e-9 for value in normalized),
+        "invalid_offloaded_users": invalid_offloaded_users,
+        "constraint_C4_ok": all(math.isfinite(value) and value <= 1.0 + _FEASIBILITY_TOL
+                                for value in normalized),
     }
+
+
+def validate_solution(config, network, channel_model, access_matrix, allocation, plan):
+    """检查最终整数方案 C1~C6 及有效卸载；成功返回时延，失败绝不伪装成本地。
+
+    这是求解成功出口的独立验证，不改变 A、f 或 X。内部搜索可评估超时的
+    候选状态，但这种状态不能作为成功求解结果返回。
+    """
+    validate_beam_hopping_plan(config, network, plan)  # C1、X 的 C6、周期覆盖
+    ns, ni = config.num_satellites, len(network.user_tasks)
+    if any(len(m) != ns or any(len(row) != ni for row in m)
+           for m in (access_matrix, allocation)):
+        raise ValueError("A/f 的维度必须为 [N_S][N_I]")
+    if any(a not in (0, 1) for row in access_matrix for a in row):
+        raise ValueError("C6：最终关联矩阵必须为二元矩阵")
+    if any(sum(access_matrix[s][i] for s in range(ns)) > 1 for i in range(ni)):
+        raise ValueError("C5：每个用户最多关联一颗卫星")
+    if any(not math.isfinite(f) or f < 0 for row in allocation for f in row):
+        raise ValueError("C3：分配算力必须有限且非负")
+    if any(sum(row) > config.sat_compute_capacity_cps * (1 + _FEASIBILITY_TOL)
+           for row in allocation):
+        raise ValueError("C2：卫星分配算力超过预算")
+    result = evaluate_latency(config, network, channel_model, access_matrix, allocation, plan)
+    if not result["constraint_C4_ok"]:
+        raise FeasibleSolutionNotFoundError(
+            f"当前方案违反 C4 或存在无效卸载：max λ={result['max_lambda']}，"
+            f"无效卸载用户={result['invalid_offloaded_users']}；不代表原联合问题无解"
+        )
+    return result
 
 
 def evaluate_objective(config, network, channel_model, access_matrix, allocation, beam_hopping_plan) -> float:
@@ -520,6 +569,7 @@ def _solve_offloading_fast(
         if best_sat is not None:
             association[best_sat][user_index] = 1.0
         gamma = max(gamma, local_term + best_zeta)
+    _require_c4(gamma, "固定资源的卸载子问题 P2")
     return {"association_relaxed": association, "gamma": float(gamma), "status": "closed_form"}
 
 
@@ -553,7 +603,8 @@ def _solve_offloading_cvxpy(
     if (~feasible_mask).any():
         constraints.append(association[~feasible_mask] == 0)
     problem = cp.Problem(cp.Minimize(gamma), constraints)
-    problem = _run_cvxpy(problem, upper_bound)
+    problem = _run_cvxpy(problem)
+    _require_c4(float(gamma.value), "CVXPY 卸载子问题 P2")
     return {
         "association_relaxed": association.value.tolist(),
         "gamma": float(gamma.value),
@@ -608,19 +659,24 @@ def _solve_resource_allocation_fast(
     association: Sequence[Sequence[float]],
     psi_unit: List[List[float]],
 ) -> Dict[str, object]:
-    """P̃3 的精确解：各卫星预算独立，逐星 minimax 分配再取最大 ε。
+    """固定整数 A 时 P̃3 的精确解：逐星 minimax 分配再取最大 ε。
 
     全局最小 ε = max( 本地用户的 λ_i , 各卫星各自的最小 ε_s )，
     因为约束 C2 是按卫星分别写的，不同卫星之间没有耦合。
     """
     num_users = len(network.user_tasks)
+    # 快速后端仅求解整数 A。拒绝分数输入，避免静默取整后声称原问题可行。
+    # 本轮不实现松弛 P3；需要分数 A 时应显式选择 cvxpy 后端。
+    if any(a not in (0, 1) for row in association for a in row):
+        raise ValueError("fast 资源分配只支持二元关联；松弛关联请使用 cvxpy")
+    if any(sum(row[i] for row in association) > 1 for i in range(num_users)):
+        raise ValueError("C5：每个用户最多关联一颗卫星")
     assignment = _assignment_from_matrix(association, num_users)
-    # 关联到"没照明该小区"的卫星是不可行的（违反 X·a=1），按本地计算处理
-    assignment = [
-        sat if sat is not None and math.isfinite(psi_unit[sat][i]) else None
-        for i, sat in enumerate(assignment)
-    ]
+    if any(sat is not None and not math.isfinite(psi_unit[sat][i])
+           for i, sat in enumerate(assignment)):
+        raise InfeasibleSubproblemError("固定 A 指向零容量链路，资源分配不能修复该无效卸载")
     state = OffloadingState(config, network, psi_unit, assignment)
+    _require_c4(state.objective(), "固定整数关联的资源分配子问题 P3")
     return {
         "allocation": state.allocation_matrix(),
         "epsilon": state.objective(),
@@ -651,7 +707,13 @@ def _solve_resource_allocation_cvxpy(
     psi_array = np.array(psi_unit, dtype=float)
     feasible_mask = np.isfinite(psi_array)
     psi_clean = np.where(feasible_mask, psi_array, 0.0)
-    effective_a = np.where(feasible_mask, association_array, 0.0)        # 不可服务的关联置 0
+    if (not np.isfinite(association_array).all() or (association_array < 0).any()
+            or (association_array > 1).any()
+            or (association_array.sum(axis=0) > 1 + _FEASIBILITY_TOL).any()):
+        raise ValueError("固定松弛 A 必须满足 0≤a≤1 和 C5")
+    if ((association_array > 0) & ~feasible_mask).any():
+        raise InfeasibleSubproblemError("固定 A 指向零容量链路，不能将其静默置零")
+    effective_a = association_array
 
     local_terms = np.array([local_latency_s(t) / t.max_latency_s for t in network.user_tasks])
     workload = np.array([t.required_cycles / t.max_latency_s / 1e9 for t in network.user_tasks])
@@ -672,10 +734,11 @@ def _solve_resource_allocation_cvxpy(
         upper_bound,
     ]
     problem = cp.Problem(cp.Minimize(epsilon), constraints)
-    problem = _run_cvxpy(problem, upper_bound)
+    problem = _run_cvxpy(problem)
+    _require_c4(float(epsilon.value), "CVXPY 资源分配子问题 P3")
     # 没被任何用户关联的 (s,i) 位置在论文里没有意义，清零以便与快速后端对齐
     allocation_array = resource_GHz.value * 1e9
-    allocation_array = np.where(effective_a > 1e-9, allocation_array, 0.0)
+    allocation_array = np.where(effective_a > 0, allocation_array, 0.0)
     return {
         "allocation": allocation_array.tolist(),
         "epsilon": float(epsilon.value),
@@ -683,34 +746,33 @@ def _solve_resource_allocation_cvxpy(
     }
 
 
-def _run_cvxpy(problem, upper_bound_constraint=None):
-    """调用 CVXPY，按 CLARABEL → SCS → SCIPY 的顺序回退求解。
+def _run_cvxpy(problem):
+    """更换数值求解器可以，删除 C4 不可以；成功状态还必须通过残差检查。
 
-    若因为 γ ≤ 1 / ε ≤ 1（也就是 C4）导致不可行，说明该场景下无论怎么调度都有
-    用户超时。此时去掉这条上界再解一次，把"C4 被违反"留给上层 evaluate_latency
-    的 constraint_C4_ok 字段报告，而不是直接中断整条曲线。
-    返回真正被求解的 problem 对象（可能是去掉上界后的新对象）。
+    当前固定变量子问题不可行与原联合问题全局不可行是两回事。
+    optimal_inaccurate 只有在所有约束残差通过检查时才能作为成功结果。
     """
     import cvxpy as cp
 
     installed = cp.installed_solvers()
-    candidates = [problem]
-    if upper_bound_constraint is not None:
-        candidates.append(cp.Problem(
-            problem.objective,
-            [c for c in problem.constraints if c is not upper_bound_constraint],
-        ))
-    for candidate in candidates:
-        for solver in ("CLARABEL", "SCS", "SCIPY"):
-            if solver not in installed:
-                continue
-            try:
-                candidate.solve(solver=solver, verbose=False)
-            except Exception:                      # 某个后端数值失败就换下一个
-                continue
-            if candidate.status in ("optimal", "optimal_inaccurate"):
-                return candidate
-    raise RuntimeError(f"CVXPY 求解失败，最终状态：{problem.status}")
+    import numpy as np
+    statuses = []
+    for solver in ("CLARABEL", "SCS", "SCIPY"):
+        if solver not in installed:
+            continue
+        try:
+            problem.solve(solver=solver, verbose=False)
+            statuses.append(problem.status)
+            if problem.status in ("optimal", "optimal_inaccurate"):
+                residuals = [np.asarray(c.violation()) for c in problem.constraints]
+                if all(np.isfinite(r).all() and (r <= _FEASIBILITY_TOL).all()
+                       for r in residuals):
+                    return problem
+        except Exception:  # 数值失败可以换后端，但仍解同一个带 C4 的问题。
+            continue
+    if statuses and all(status == "infeasible" for status in statuses):
+        raise InfeasibleSubproblemError("当前 CVXPY 子问题不可行（保留 C4）；不代表原联合问题无解")
+    raise RuntimeError(f"CVXPY 未得到通过约束残差检查的解，状态：{statuses}")
 
 
 # =====================================================================
@@ -731,13 +793,15 @@ def solve_joint_offloading_and_allocation(
 
     返回字典含 access_matrix / allocation / max_lambda / bcd_history 等。
     """
+    validate_beam_hopping_plan(config, network, plan)
     num_users = len(network.user_tasks)
     capacity_table = channel_model.average_capacity_table(plan)      # C^BH_{s,i}，包括此BHTP下各卫星-小区对的BH平均容量
     psi_unit = build_psi_matrix(config, network, capacity_table)     # 式 (28) 的单位增量
 
     # ---- 第 2 行：A、f^S 的可行初值 ----
-    # 取"全本地计算"（A = 0）作为初值：它必然满足 C1~C6，同时也是一个明确的性能
-    # 基准 —— 后续每一步 BCD 只有比它更好才会被接受。
+    # 全本地只在所有本地时延≤D_i 时可行。若初值超时，仍保留原有搜索逻辑
+    # 尝试降低目标，但内部候选不是成功解；出口必须通过完整验证。
+    # 搜索失败只报告“未找到可行解”，不据此证明联合问题无解。
     state = OffloadingState(config, network, psi_unit, [None] * num_users)
     best_objective = state.objective()  # max λ_i，即优化目标，需要最小化此变量
 
@@ -752,7 +816,12 @@ def solve_joint_offloading_and_allocation(
         forecast = state.forecast_matrix()
         # 第 5 行：给定 f^S，用 Algorithm 1 更新 A
         zeta_matrix = build_zeta_matrix(config, network, capacity_table, forecast)
-        offloading_result = solve_offloading(config, network, zeta_matrix)
+        try:
+            offloading_result = solve_offloading(config, network, zeta_matrix)
+        except InfeasibleSubproblemError:
+            # 当前固定预测矩阵无可行卸载解时，不删除 C4 继续解。
+            # 保留已有状态，走原有最终局部扫描，再由出口验证是否可行。
+            break
         # 若 solve_offloading 函数使用cvxpy求解，则需 _assignment_from_matrix 对其离散化
         proposed = _assignment_from_matrix(offloading_result["association_relaxed"], num_users)
         # 按用户顺序依次排列其选择的卫星，若本地卸载或选择的卫星并未在BHTP中照射该小区，则为None
@@ -794,7 +863,7 @@ def solve_joint_offloading_and_allocation(
 
     access_matrix = state.access_matrix()
     allocation = state.allocation_matrix()
-    latency_result = evaluate_latency(config, network, channel_model, access_matrix, allocation, plan)
+    latency_result = validate_solution(config, network, channel_model, access_matrix, allocation, plan)
     return {
         "access_matrix": access_matrix,
         "allocation": allocation,
@@ -858,98 +927,95 @@ def design_beam_hopping_matching(
     network: SatelliteNetwork,
     channel_model: ChannelModel,
 ) -> BeamHoppingPlan:
-    """Algorithm 4 第 2-8 行：多对多匹配生成初始 BHTP。
+    """Algorithm 4 初始多对多匹配：逐轮提案、动态偏好、每星每槽容量限制。
 
-    论文第四节 B 的匹配模型：
-        V = {v^s_i|v^s_i = s*N_I +i,i∈I,s ∈ S}   卫星-小区关联，v^s_i 表示"卫星 s 照明小区 i"
-        J = {J_t|t = 0,1,...,N_w-1}     一个 BHP 内的 N_w 个时隙
-        偏好 U^V_{i,s}(Ω) = C^t_i，U^J_t(Ω) = C^t_i   （式 (31)(32)） ,表示V/J在当前关联Ω下对J/V的偏好值
-        约束 定义 1 第 3 条：每颗卫星在每个时隙最多匹配 N_K 个小区（即 C1）
+    v=(s,i) 被接受一个时隙后仍可申请其他未匹配时隙。只有该星所有时隙
+    均满，或该关联没有可申请时隙时，才暂时不进入 pending；下一轮重建。
+    每轮依据当前匹配重算两侧容量偏好，接收侧每接受一个提案后再重算，
+    避免沿用已经因同频干扰改变的排序。满槽的既有匹配留给后续 swap 优化。
 
-    论文另外规定的两条"偏好置零"规则在这里实现为硬性规则：
-      1) 若 v^s_i 已匹配 J_t，则 J_t 对任意 s'≠s 的 v^{s'}_i 偏好为 0
-         （同一时隙重复照明同一小区不会提升容量，属于浪费波束）；
-      2) 若卫星 s 在 J_t 已有 N_K 个小区，则 J_t 对该星其余小区 v 的偏好为 0（C1）。
-
-    算法实现：延迟接受（deferred acceptance）。每个 v^s_i 沿偏好列表由高到低向时隙
-    提案，时隙对同一颗卫星只保留偏好最高的 N_K 个，被拒者继续向下一个时隙提案，
-    直到所有偏好列表用尽 —— 也就是论文所说的
-    "each satellite has explicitly designated the N_K cells for each time slot"。
+    为落实第三节“每小区每周期至少服务一次”，先完成全体小区首次覆盖，
+    再开放重复时隙匹配；这是显式的可行性初始化约定，不是容量加权。
+    同槽跨星重复照明偏好为零，但不是硬约束：只有无法再增加非重复
+    匹配时才允许零偏好提案，以处理 N_S*N_K>N_I 时 C1 的等式要求。
+    不再调用按无干扰容量兜底补齐的旧逻辑。
     """
-    num_slots = config.num_slots_per_BHP            # N_w
-    num_satellites = len(network.satellites)        # N_S
-    num_cells = len(network.ground_cells)           # N_I
-    beams = config.num_beams_per_satellite          # N_K
+    nw, ns, ni = config.num_slots_per_BHP, len(network.satellites), len(network.ground_cells)
+    nk = config.num_beams_per_satellite
+    if min(nw, ns, ni, nk) <= 0 or nk > ni or nw * ns * nk < ni:
+        raise ValueError("无法同时满足每星每槽 N_K 个不同小区和周期全覆盖")
+    holders = [[[] for _ in range(ns)] for _ in range(nw)]  # 各时隙中，各卫星所关联的小区编号
+    occupied = [set() for _ in range(nw)]   # 各时隙已被照射的小区集合
+    covered = set()         # 至少被波束照射一次的小区集合
+    target = nw * ns * nk   # 完成匹配后，应该满足每个卫星在所有时隙波束数均为上限N_k
+    matched = 0
 
-    # 表示每个时隙每颗卫星保留的 N_K 个小区，用于实现用户规则 2，即避免同一颗卫星在同一时隙照明超过 N_K 个小区
-    holders: List[List[List[int]]] = [[[] for _ in range(num_satellites)] for _ in range(num_slots)]  
-    # 表示每个时隙已被点亮的小区，用于实现用户规则1，即避免同一时隙重复照明同一小区
-    occupied_cells: List[set] = [set() for _ in range(num_slots)]      
+    def capacity(s, i, t):
+        active = [(other_s, c) for other_s in range(ns) for c in holders[t][other_s]]
+        return channel_model._capacity_from_sinr(
+            channel_model.compute_sinr_for_user(s, i, active))
 
-    def preference_value(sat_id: int, cell_id: int, slot_id: int) -> float:
-        """U^V_{i,s}(J_t) = C^t_i：把小区 i 放进该时隙能拿到的容量，单位 bit/s。
+    while matched < target:
+        # 每轮从当前匹配重建候选与偏好，不让一次接受永久删除一个 卫星-用户关联v。
+        # first_coverage 为标识符，判断此时是否全部小区至少被覆盖一次，若已符合可安排不同时隙的重复照明
+        first_coverage = len(covered) < ni  
+        options = {}    # 记录本轮关联中 各卫星-小区对 可关联时隙序号
+        for s in range(ns):
+            for i in range(ni):
+                if first_coverage and i in covered:
+                # 若小区未被全覆盖，且该小区已被照射过，则暂时不考虑其作为候选，优先为无覆盖小区进行匹配时隙
+                    continue
+                # 若小区已经全覆盖，或此小区仍未被照射，将此小区作为候选，查找此 卫星-小区对 可关联时隙序号
+                slots = [t for t in range(nw)
+                         if len(holders[t][s]) < nk and i not in holders[t][s]]
+                if slots:
+                    options[(s, i)] = slots
 
-        干扰源取"该时隙当前已保留的全部关联"，这就是论文第 6-7 行
-        "Calculate U 并更新偏好列表"所描述的动态偏好。
-        """
-        active = [(s, c) for s in range(num_satellites) for c in holders[slot_id][s]]
-        # active.append((sat_id, cell_id)) 貌似与下方“holders[slot_id][sat_id].append(cell_id)”重复了
-        sinr = channel_model.compute_sinr_for_user(sat_id, cell_id, active)
-        return channel_model._capacity_from_sinr(sinr)
+        # 判断是否存在小区在某个时隙未被照明，若不存在则后续进行重复照明（浪费波束），若存在则优先寻找该时隙进行照明
+        nonredundant_exists = any(
+            cell_id not in occupied[slot_id]
+            for (_, cell_id), candidate_slots in options.items()
+            for slot_id in candidate_slots
+        )
 
-    # ---- 第 2 行：构造每个 v^s_i 的初始偏好列表 ----
-    # 静态几何下各时隙的基础容量相同，用 (卫星, 小区) 决定的轮转量做确定性打破并列，
-    # 让不同小区分散到不同时隙，而不是所有 v 都挤向同一个 J_t。
-    preference_lists: Dict[Tuple[int, int], List[int]] = {}
-    for sat_id in range(num_satellites):
-        for cell_id in range(num_cells):
-            offset = (cell_id + sat_id * beams) % num_slots # 轮转量，保证不同卫星-小区的偏好起始时隙错开，sat_id * beams没有什么特别含义
-            preference_lists[(sat_id, cell_id)] = [(offset + k) % num_slots for k in range(num_slots)] # 每个 v^s_i 的偏好时隙排序列表
 
-    # ---- 第 3-8 行：延迟接受主循环 ----
-    next_index = {key: 0 for key in preference_lists}     # 每个 用户-卫星对v 下一个要提案的时隙序号(初始均为偏好列表中第一个时隙)
-    pending: List[Tuple[int, int]] = sorted(              # 对准容量高的关联优先提案，由于偏好容量仅与 用户-卫星对v 有关，与时隙无关，所以此处直接对所有 用户-卫星对v 容量排序，容量大的无论哪个时隙均优先挑选
-        preference_lists.keys(),
-        key=lambda key: channel_model.boresight_capacity[key],  # 按容量排序，列表内容为排序后的(卫星, 小区)元组
-        reverse=True,
-    )
-    while pending:
-        still_pending: List[Tuple[int, int]] = []
-        for sat_id, cell_id in pending:
-            index = next_index[(sat_id, cell_id)]         # 当前 用户-卫星对v 要提案的时隙在偏好列表中的索引
-            if index >= num_slots:
-                continue                                  # 偏好列表已用尽
-            slot_id = preference_lists[(sat_id, cell_id)][index]    # 当前 用户-卫星对v 要提案的实际时隙
-            next_index[(sat_id, cell_id)] = index + 1
-            # 第 4 行：若该时隙这个小区已被别的卫星点亮，则拒绝并等待向下一个时隙提案
-            if cell_id in occupied_cells[slot_id]:
-                still_pending.append((sat_id, cell_id))
-                continue
-            # 第 5 行：记录当前时隙卫星照射用户、当前时隙已被照射用户，用于判断约束；
-            holders[slot_id][sat_id].append(cell_id)
-            occupied_cells[slot_id].add(cell_id)
-            if len(holders[slot_id][sat_id]) > beams:
-                # 第 6-7 行：按照当前时隙已经完成匹配情况，重算偏好并重排，令时隙保留偏好最高的 v；超过 N_K 就拒掉最差的那个
-                ranked = sorted(
-                    holders[slot_id][sat_id],
-                    key=lambda c: preference_value(sat_id, c, slot_id),
-                    reverse=True,
-                )
-                holders[slot_id][sat_id] = ranked[:beams]
-                for rejected in ranked[beams:]:     # 超过 N_K 的小区被拒绝，等待向下一个时隙提案
-                    occupied_cells[slot_id].discard(rejected)
-                    still_pending.append((sat_id, rejected))
-        pending = still_pending
+        preferences = {}    # 卫星-小区对 的偏好列表，按此顺序选择时隙
+        for (s, i), slots in options.items():
+            if nonredundant_exists:
+                # 若存在小区在某个时隙未被照明，则重新设置可关联时隙 slots ，跳过其他已被照明的时隙，优先寻找该时隙进行照明
+                # 显然，若此小区i不是“存在小区在某个时隙未被照明”的小区，即此小区i已在所有时隙被照明过，则直接跳过此小区i（可关联时隙为空）
+                slots = [t for t in slots if i not in occupied[t]]
+            if slots:
+                offset = (i + s * nk) % nw  # 仅在容量相同的情况下用于打破并列。
+                preferences[(s, i)] = sorted(
+                    slots, key=lambda t: (-(capacity(s, i, t) if i not in occupied[t] else 0.0),
+                                          (t - offset) % nw))
+        pending = list(preferences)
+        proposals = [(s, i, preferences[(s, i)][0]) for s, i in pending]    # 取偏好列表第一个时隙
+        before = matched
+        while proposals:
+            # J_t 的接收偏好同样动态更新；一次只接纳最优可行提案，随后
+            # 每次接受一个提案后，重新筛选剩余提案，防止同轮先后接纳造成跨星重复或容量过期。
+            proposals = [(s, i, t) for s, i, t in proposals
+                         if len(holders[t][s]) < nk and i not in holders[t][s]  # 卫星波束上限约束与避免重复添加
+                         and (not first_coverage or i not in covered)           # 若存在未照射小区，优先进行，保证BH周期内全小区覆盖
+                         and (not nonredundant_exists or i not in occupied[t])] # 若存在“某小区在某时隙未照射”，优先进行，避免波束浪费
+            if not proposals:
+                break
+            # v表示(s, i, t)，按容量大小依次进行卫星-小区对和时隙的关联
+            s, i, t = max(proposals, key=lambda v: (
+                capacity(*v) if v[1] not in occupied[v[2]] else 0.0,
+                -v[2], -v[0], -v[1]))   
+            holders[t][s].append(i)
+            occupied[t].add(i)
+            covered.add(i)
+            matched += 1
+            proposals.remove((s, i, t))
+        if matched == before:
+            # 每个成功轮次至少新增一个匹配，因此最多 target 轮，无死循环。
+            raise RuntimeError("动态匹配没有可接受提案，未能构造满足覆盖和 C1 的计划")
 
-    # ---- 兜底补齐：保证 C1 取等号（每星每槽正好 N_K 个波束）----
-    for slot_id in range(num_slots):
-        for sat_id in range(num_satellites):
-            _fill_slot_to_beam_capacity(
-                holders, occupied_cells, slot_id, sat_id, beams, num_cells,
-                rank_key=lambda c, s=sat_id: channel_model.boresight_capacity[(s, c)],
-            )
-
-    plan = _holders_to_plan(holders, num_slots, num_satellites, num_cells)
+    plan = _holders_to_plan(holders, nw, ns, ni)
     validate_beam_hopping_plan(config, network, plan)
     return plan
 
@@ -1084,9 +1150,11 @@ def validate_beam_hopping_plan(
          （论文第三节 "each ground cell must be served at least once within a single BHP"）。
     """
     expected = (config.num_slots_per_BHP, config.num_satellites, config.num_ground_cells)
-    actual = (len(plan), len(plan[0]) if plan else 0, len(plan[0][0]) if plan and plan[0] else 0)
-    if actual != expected:
-        raise ValueError(f"BHTP 维度错误：期望 {expected}，实际 {actual}")
+    if (len(plan) != expected[0] or any(len(slot) != expected[1] for slot in plan)
+            or any(len(row) != expected[2] for slot in plan for row in slot)):
+        raise ValueError(f"BHTP 每一行的维度必须符合 {expected}")
+    if any(x not in (0, 1) for slot in plan for row in slot for x in row):
+        raise ValueError("C6：BHTP 必须为二元张量")
 
     for slot_id, slot_plan in enumerate(plan):
         for sat_id, satellite_row in enumerate(slot_plan):
@@ -1180,7 +1248,10 @@ def swap_improve_beam_hopping(
         candidate = propose_swap(config, current_plan, rng)
         if candidate is None:
             continue
-        result = solve_joint_offloading_and_allocation(config, network, channel_model, candidate)
+        try:
+            result = solve_joint_offloading_and_allocation(config, network, channel_model, candidate)
+        except (FeasibleSolutionNotFoundError, InfeasibleSubproblemError):
+            continue
         if result["max_lambda"] + config.tolerance < current_objective:
             return candidate
     return None

@@ -25,6 +25,8 @@ from channel_model import ChannelModel
 from config import SimConfig
 from satellite_network import SatelliteNetwork
 from solvers import (
+    FeasibleSolutionNotFoundError,
+    InfeasibleSubproblemError,
     design_beam_hopping_matching,
     evaluate_objective,
     propose_swap,
@@ -92,13 +94,21 @@ def proposed_jbhco_mb(
         attempted_swaps += 1
 
         # 第 13 行：对交换后的匹配重新用 Algorithm 3 求最优 A 和 f^S
-        candidate_result = solve_joint_offloading_and_allocation(
-            config, network, channel_model, candidate_plan
-        )
+        try:
+            candidate_result = solve_joint_offloading_and_allocation(
+                config, network, channel_model, candidate_plan
+            )
+        except (FeasibleSolutionNotFoundError, InfeasibleSubproblemError):
+            # 定义 3 要求可行且改进。内层未找到可行解的交换不能被接受，
+            # 保留当前已验证可行的方案；这不宣称候选 BHTP 全局不可行。
+            if record_history:
+                history.append(best_objective)
+            continue
         candidate_objective = float(candidate_result["max_lambda"])
 
         # 第 14 行：定义 3 的 swap-blocking pair 判据 —— 交换后目标严格下降就接受
-        if candidate_objective < best_objective - config.tolerance:
+        if (candidate_result["latency_result"]["constraint_C4_ok"]
+                and candidate_objective < best_objective - config.tolerance):
             beam_hopping_plan = candidate_plan
             result = candidate_result
             best_objective = candidate_objective

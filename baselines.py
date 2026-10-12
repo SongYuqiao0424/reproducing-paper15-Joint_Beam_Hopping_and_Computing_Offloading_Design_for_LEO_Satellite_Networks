@@ -25,20 +25,22 @@
 
 from __future__ import annotations
 
+import math
 from typing import Dict, List
 
 from channel_model import ChannelModel
 from config import SimConfig
 from satellite_network import SatelliteNetwork
 from solvers import (
+    FeasibleSolutionNotFoundError,
     AccessMatrix,
     ResourceMatrix,
     communication_overhead_s,
     design_polling_beam_hopping,
-    evaluate_latency,
     illuminating_satellites,
     local_latency_s,
     solve_joint_offloading_and_allocation,
+    validate_solution,
 )
 
 
@@ -58,6 +60,9 @@ def run_computing_locally(
     """
     normalized = [local_latency_s(task) / task.max_latency_s for task in network.user_tasks]
     latencies = [local_latency_s(task) for task in network.user_tasks]
+    if any(not math.isfinite(v) or v > 1.0 + 1e-7 for v in normalized):
+        # CL 没有可调变量；本地方案超时只能报告该基线不可行。
+        raise FeasibleSolutionNotFoundError("CL 本地方案违反 C4；不代表联合卸载问题无解")
     return {
         "algorithm": "CL",
         "max_lambda": max(normalized, default=0.0),
@@ -67,7 +72,7 @@ def run_computing_locally(
         "normalized_latencies": normalized,
         "local_users": [task.user_id for task in network.user_tasks],
         "offloaded_users": [],
-        "constraint_C4_ok": all(v <= 1.0 + 1e-9 for v in normalized),
+        "constraint_C4_ok": True,  # 上方已按统一残差量级检查 C4。
     }
 
 
@@ -155,7 +160,7 @@ def run_jbhco_pg(
             share = network.user_tasks[i].required_cycles / max(total_cycles, 1e-12)
             allocation[sat_id][i] = config.sat_compute_capacity_cps * share
 
-    latency_result = evaluate_latency(
+    latency_result = validate_solution(
         config, network, channel_model, access_matrix, allocation, plan
     )
     return {
