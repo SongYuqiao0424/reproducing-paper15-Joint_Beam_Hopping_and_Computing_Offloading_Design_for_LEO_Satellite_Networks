@@ -15,6 +15,7 @@
 config.solver_backend 可取：
   "cvxpy"：严格按论文用凸优化建模 P̃2 / P̃3，交给 CVXPY 调 CLARABEL/SCS 求解，
            对应论文 Algorithm 1/2 里的 "Solve P̃2(P̃3) with CVX"。
+           候选关联和局部改接后的实际 f^S 均使用 CVXPY；预测算力仍用二分估计。
   "fast" ：P̃2 用闭式解，P̃3 仅支持整数关联下的逐星二分；分数关联应使用 cvxpy。
 公开子问题求解器成功返回时必须满足 C4；当前联合搜索仍保留预测矩阵和
 最差用户局部搜索，不应将其理解为已恢复论文原始的松弛 BCD 流程。
@@ -333,8 +334,9 @@ class OffloadingState:
     因为约束 C2 是按卫星分别写的、各卫星互不耦合，所以
         max_i λ_i = max( 本地用户的 L_i , 各卫星的 ε_s )
 
-    这样"把某个用户从卫星 s 挪到 s'"只需重算 s 和 s' 两次二分，而不必把整个问题
-    重解一遍 —— 这是 Algorithm 3 与 Algorithm 4 能跑快的关键。
+    fast 模式下，评估用户改接只需对受影响卫星做二分；cvxpy 模式下，
+    实际资源分配和改接评估均求解完整的固定 A 资源子问题。
+    预测矩阵仍使用原有二分估计，它只用于提出关联候选，不是实际资源分配。
     """
 
     def __init__(
@@ -380,10 +382,48 @@ class OffloadingState:
                 self.served[sat_id].append(user_index)
         self.epsilon = [0.0] * self.num_satellites
         self.allocation_per_sat: List[Dict[int, float]] = [{} for _ in range(self.num_satellites)]
-        for sat_id in range(self.num_satellites):   # ！！！求解各卫星的ε和卫星计算资源分配；一个卫星的ε结果代表关联此卫星的各用户maxλ，所有卫星的ε结果最终可以代表全部用户的maxλ
+        # 全本地时没有卫星计算任务，实际分配自然全零，无需调用任何求解器。
+        # 保留这种初始化方式，也允许后续搜索尝试修复本地初值超时的情况。
+        if all(sat_id is None for sat_id in self.assignment):
+            return
+
+        if self.config.solver_backend == "cvxpy":
+            self._allocate_resources_cvxpy()
+            return
+
+        # fast 后端沿用逐星二分；cvxpy 后端已在上方返回，不会经过这里。
+        for sat_id in range(self.num_satellites):
             self.epsilon[sat_id], self.allocation_per_sat[sat_id] = _minimax_allocation_on_satellite(
                 self.served[sat_id], self.psi_value, self.workload, self.budget
             )
+
+    def _allocate_resources_cvxpy(self) -> None:
+        """固定当前整数 A，用 CVXPY 求实际 f^S，并保存到当前状态。
+
+        不能只调用 CVXPY 后丢弃结果：后续 objective、forecast_matrix 和
+        最终 allocation_matrix 都读取 allocation_per_sat，必须保存 CVXPY
+        实际返回的算力，并据此重新计算各卫星用户的最大 λ。
+        """
+        association = self.access_matrix()  # 当前用户关联的 0-1 矩阵 A。
+        resource_result = solve_resource_allocation(
+            self.config, self.network, association, self.psi_unit
+        )  # 后端分派进入 CVXPY 的固定 A 资源子问题，保留 C2、C3、C4。
+        allocation = resource_result["allocation"]  # CVXPY 返回的 f^S，单位 cycle/s。
+
+        for sat_id in range(self.num_satellites):
+            for user_index in self.served[sat_id]:
+                available = allocation[sat_id][user_index]  # 该关联用户实际获得的算力。
+                if not math.isfinite(available) or available <= 0.0:
+                    raise RuntimeError("CVXPY 返回了无效卸载算力，不能保存为候选方案")
+                self.allocation_per_sat[sat_id][user_index] = available
+                user_lambda = (
+                    self.psi_value[user_index] + self.workload[user_index] / available
+                )  # 用实际分配计算 λ_i，而不是直接使用求解器的辅助变量 ε。
+                self.epsilon[sat_id] = max(self.epsilon[sat_id], user_lambda)
+
+        # 非瓶颈卫星上的最优分配可能不唯一，其用户 λ 不一定相等。
+        # 因此必须逐用户计算后取最大值，并再次核对实际方案是否满足 C4。
+        _require_c4(self.objective(), "CVXPY 实际资源分配")
 
     # ---------- 对外：目标值与增量评估 ----------
     def objective(self) -> float:
@@ -420,6 +460,21 @@ class OffloadingState:
         if target is not None and not math.isfinite(self.psi_unit[target][user_index]):
             return float("inf")                       # 目标卫星根本没照明这个小区
 
+        if self.config.solver_backend == "cvxpy":
+            # 局部搜索也是一种候选关联。使用相同后端评估，避免主更新用
+            # CVXPY，而局部搜索又以二分分配替换最终实际算力。
+            trial_assignment = list(self.assignment)  # 只用于评估的关联副本，不修改当前状态。
+            trial_assignment[user_index] = target
+            try:
+                trial_state = OffloadingState(
+                    self.config, self.network, self.psi_unit, trial_assignment
+                )  # 构造时按 cvxpy 后端求新的实际资源分配。
+            except InfeasibleSubproblemError:
+                return float("inf")  # 当前改接不满足 C4，不作为可接受的局部动作。
+            if trial_state.objective() > 1.0 + _FEASIBILITY_TOL:
+                return float("inf")  # 全本地候选不调用求解器，在此显式检查 C4。
+            return trial_state.objective()
+
         # 本地用户的最大 λ（把 user_index 的归属变化考虑进去）
         local_max = max(
             (self.local_lambda[i] for i, s in enumerate(self.assignment)
@@ -450,8 +505,21 @@ class OffloadingState:
         return max(local_max, sat_max)
 
     def apply_move(self, user_index: int, target: Optional[int]) -> None:
-        """真正执行改判，并刷新受影响卫星的资源分配。"""
+        """真正执行改判，并按所选后端刷新实际资源分配。"""
         if self.assignment[user_index] == target:
+            return
+        if self.config.solver_backend == "cvxpy":
+            trial_assignment = list(self.assignment)  # 待接受的新关联，先求解再写入当前状态。
+            trial_assignment[user_index] = target
+            trial_state = OffloadingState(
+                self.config, self.network, self.psi_unit, trial_assignment
+            )  # 求解失败时抛出异常，当前状态仍保持原来的关联和分配。
+            _require_c4(trial_state.objective(), "局部搜索的实际改接方案")
+            self.assignment = trial_state.assignment
+            self.served = trial_state.served
+            self.psi_value = trial_state.psi_value
+            self.epsilon = trial_state.epsilon
+            self.allocation_per_sat = trial_state.allocation_per_sat
             return
         self.assignment[user_index] = target
         self._refresh_all()
@@ -835,9 +903,19 @@ def solve_joint_offloading_and_allocation(
         # 因此加一道单调性保护：整体更新只有确实降低了真实目标才接受；否则退化为
         # 逐用户最优响应（仍属块坐标下降，只是把每个 a_i 视作一个块），保证 BCD 的
         # 目标序列单调不增，与论文图 2a 的收敛形态一致。
-        candidate_state = OffloadingState(config, network, psi_unit, proposed)
-        candidate_objective = candidate_state.objective()
-        if candidate_objective < best_objective - config.tolerance:
+        candidate_state = None  # 保存已完成实际资源求解的候选状态；不可行时保持 None。
+        candidate_objective = float("inf")  # 不可行候选不能通过目标改善判断。
+        try:
+            candidate_state = OffloadingState(config, network, psi_unit, proposed)
+            # cvxpy：构造状态时调用 CVXPY 求固定候选 A 的 f^S。
+            # fast：构造状态时使用原有逐星二分。两者均用实际分配评估目标。
+            candidate_objective = candidate_state.objective()
+        except InfeasibleSubproblemError:
+            # 预测选星可能拥塞，导致固定候选 A 的 P3 不可行。
+            # 拒绝该候选，保留当前状态，并进入原有局部搜索；不删除 C4，
+            # 也不改用 fast 后端求解一个超时方案。
+            pass
+        if candidate_state is not None and candidate_objective < best_objective - config.tolerance:
             state, best_objective = candidate_state, candidate_objective
         else:   
             # 若新优化目标值收敛或恶化，则进行逐个尝试本地计算和其他卫星；如果没有任何动作能继续降低目标，立刻break
